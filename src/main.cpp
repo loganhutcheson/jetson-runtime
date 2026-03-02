@@ -30,6 +30,13 @@ int main() {
     // Main loop: 2Hz “planner” tick (LLM is slow)
     for (int i = 0; i < 30; i++) {
         uint64_t t0 = now_ns();
+        static uint64_t last_tick_ns = 0;
+        double loop_ms = -1;
+
+        if (last_tick_ns != 0) {
+            loop_ms = (double)(t0 - last_tick_ns) / 1e6;
+        }
+        last_tick_ns = t0;
 
         auto cam_opt = cam_latest.peek(); // latest frame (don’t clear)
         std::vector<ImuSample> imu_samples;
@@ -52,7 +59,8 @@ int main() {
         csv << t0 << "," << cam_seq << "," << cam_age_ms << "," << imu_seq << "," << imu_age_ms
             << "," << imu_cnt << "," << resp.seq << "," << llm_latency_ms << "\n";
         std::cout << "tick " << i << " imu_cnt=" << imu_cnt << " cam_age_ms=" << cam_age_ms
-                  << " imu_age_ms=" << imu_age_ms << " llm_latency_ms=" << llm_latency_ms << "\n";
+                  << " imu_age_ms=" << imu_age_ms << " llm_latency_ms=" << llm_latency_ms
+                  << " loop_ms=" << loop_ms << "\n";
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
