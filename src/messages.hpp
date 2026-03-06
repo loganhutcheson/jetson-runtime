@@ -33,3 +33,42 @@ struct LlmResponse {
     std::string text;
     // later: tokens/sec, latency, etc.
 };
+
+// ---------- Input events ----------
+
+struct PlannerTick {
+    uint64_t t_ns = 0;
+};
+
+struct CameraObserved {
+    CameraFrame frame;
+};
+
+struct ImuBatchReady {
+    uint64_t t_ns = 0;
+    std::vector<ImuSample> samples;
+};
+
+using InputEvent = std::variant<PlannerTick, CameraObserved, ImuBatchReady>;
+
+// ---------- Output actions ----------
+
+struct DisplayText {
+    std::string line1;
+    std::string line2;
+};
+
+struct PlayTone {
+    int frequency_hz = 0;
+    int duration_ms = 0;
+};
+
+struct LlmPrompt {
+    std::string prompt;
+};
+
+struct LogLine {
+    std::string text;
+};
+
+using OutputAction = std::variant<DisplayText, PlayTone, LlmPrompt, LogLine>;

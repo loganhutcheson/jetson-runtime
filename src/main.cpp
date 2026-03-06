@@ -1,14 +1,44 @@
+#include "consumers.hpp"
 #include "latest.hpp"
 #include "llm.hpp"
 #include "messages.hpp"
 #include "producers.hpp"
+#include "ringbuffer.hpp"
+#include "state.hpp"
 #include "time.hpp"
 
-#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iostream>
 #include <thread>
+#include <vector>
+
+static void dispatch_action(const OutputAction &action, ConsoleLcdConsumer &lcd,
+                            ConsoleSpeakerConsumer &speaker, ConsoleLogConsumer &logger,
+                            LlmActionConsumer &llm_consumer) {
+    std::visit(
+        [&](const auto &a) {
+            using T = std::decay_t<decltype(a)>;
+
+            if constexpr (std::is_same_v<T, DisplayText>) {
+                lcd.consume(a);
+            } else if constexpr (std::is_same_v<T, PlayTone>) {
+                speaker.consume(a);
+            } else if constexpr (std::is_same_v<T, LogLine>) {
+                logger.consume(a);
+            } else if constexpr (std::is_same_v<T, LlmPrompt>) {
+                const auto resp = llm_consumer.consume(a);
+                logger.consume(LogLine{
+                    "llm response: " + resp.text,
+                });
+                lcd.consume(DisplayText{
+                    "LLM",
+                    resp.text.substr(0, 28),
+                });
+            }
+        },
+        action);
+}
 
 int main() {
     Latest<CameraFrame> cam_latest;
@@ -18,49 +48,57 @@ int main() {
     ImuProducer imu(imu_buf, 200);
 
     StubLlmClient llm;
+    LlmActionConsumer llm_consumer(llm);
+
+    ConsoleLcdConsumer lcd;
+    ConsoleSpeakerConsumer speaker;
+    ConsoleLogConsumer logger;
+
+    SystemState state;
 
     cam.start();
     imu.start();
 
     std::ofstream csv("results_mac.csv");
-    csv << "t_ns,cam_seq,cam_age_ms,imu_seq,imu_age_ms,imu_cnt,llm_seq,llm_latency_ms\n";
+    csv << "t_ns,tick,mode,cam_seq,imu_seq,imu_cnt,accel_mag,motion_alert\n";
 
-    uint64_t llm_seq = 0;
-
-    // Main loop: 2Hz “planner” tick (LLM is slow)
     for (int i = 0; i < 30; i++) {
-        uint64_t t0 = now_ns();
-        static uint64_t last_tick_ns = 0;
-        double loop_ms = -1;
+        const uint64_t t0 = now_ns();
 
-        if (last_tick_ns != 0) {
-            loop_ms = (double)(t0 - last_tick_ns) / 1e6;
+        // Pull latest camera snapshot into state as an event
+        if (auto cam_opt = cam_latest.peek()) {
+            auto cam_actions = handle_event(state, CameraObserved{*cam_opt});
+            for (const auto &action : cam_actions) {
+                dispatch_action(action, lcd, speaker, logger, llm_consumer);
+            }
         }
-        last_tick_ns = t0;
 
-        auto cam_opt = cam_latest.peek(); // latest frame (don’t clear)
+        // Drain IMU queue and feed as batch
         std::vector<ImuSample> imu_samples;
-        auto imu_cnt = imu_buf.popall(imu_samples); // latest imu
+        const size_t imu_cnt = imu_buf.popall(imu_samples);
 
-        uint64_t cam_seq = cam_opt ? cam_opt->seq : 0;
-        uint64_t imu_seq = imu_cnt > 0 ? imu_samples.back().seq : 0;
+        if (imu_cnt > 0) {
+            auto imu_actions = handle_event(state, ImuBatchReady{t0, std::move(imu_samples)});
+            for (const auto &action : imu_actions) {
+                dispatch_action(action, lcd, speaker, logger, llm_consumer);
+            }
+        }
 
-        double cam_age_ms = cam_opt ? (double)(t0 - cam_opt->t_capture_ns) / 1e6 : -1;
-        double imu_age_ms = imu_cnt > 0 ? (double)(t0 - imu_samples.back().t_capture_ns) / 1e6 : -1;
+        // Planner tick drives high-level status updates
+        auto tick_actions = handle_event(state, PlannerTick{t0});
+        for (const auto &action : tick_actions) {
+            dispatch_action(action, lcd, speaker, logger, llm_consumer);
+        }
 
-        LlmRequest req;
-        req.seq = llm_seq++;
-        req.t_request_ns = t0;
-        req.prompt = "cam_seq=" + std::to_string(cam_seq) + " imu_seq=" + std::to_string(imu_seq);
+        csv << t0 << "," << state.tick_count << "," << to_string(state.mode) << ","
+            << state.last_cam_seq << "," << state.last_imu_seq << "," << imu_cnt << ","
+            << state.last_accel_mag << "," << (state.last_motion_alert ? 1 : 0) << "\n";
 
-        auto resp = llm.infer(req);
-        double llm_latency_ms = (double)(resp.t_response_ns - req.t_request_ns) / 1e6;
+        std::cout << "[MAIN] tick=" << i << " mode=" << to_string(state.mode)
+                  << " cam_seq=" << state.last_cam_seq << " imu_seq=" << state.last_imu_seq
+                  << " imu_cnt=" << imu_cnt << " accel_mag=" << state.last_accel_mag
+                  << " alert=" << state.last_motion_alert << "\n";
 
-        csv << t0 << "," << cam_seq << "," << cam_age_ms << "," << imu_seq << "," << imu_age_ms
-            << "," << imu_cnt << "," << resp.seq << "," << llm_latency_ms << "\n";
-        std::cout << "tick " << i << " imu_cnt=" << imu_cnt << " cam_age_ms=" << cam_age_ms
-                  << " imu_age_ms=" << imu_age_ms << " llm_latency_ms=" << llm_latency_ms
-                  << " loop_ms=" << loop_ms << "\n";
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
