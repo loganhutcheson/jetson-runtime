@@ -70,6 +70,7 @@ class ImuProducer {
             s.seq = seq_++;
             s.t_capture_ns = now_ns();
             // dummy values; later you’ll read real IMU
+            // TODO: read from IMU sensor
             s.az = 9.81f;
             out_.push(std::move(s));
             produced_.fetch_add(1, std::memory_order_relaxed);
