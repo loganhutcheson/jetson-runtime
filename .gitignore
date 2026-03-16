@@ -1,4 +1,5 @@
 /build
 /build-local
 /build-runtime
+__pycache__/
 /results_mac.csv
