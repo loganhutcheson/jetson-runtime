@@ -75,18 +75,29 @@ Validated result after applying the partition DTB fix:
 - Argus still capture succeeds to JPEG
 
 ----- Jetson Camera Inference -----
-The first working live inference path on the Jetson is documented here:
+The current live inference path on the Jetson is documented here:
 
 - `jetson/inference/README.txt`
-- `jetson/inference/mobilenetv2_camera_demo.py`
+- `jetson/inference/yolo_positional_camera_demo.py`
+- `jetson/inference/pose_camera_demo.py`
 
 Current status:
 - CSI camera capture works through Argus / GStreamer
-- OpenCV DNN can run a live `MobileNetV2` ONNX model on the Jetson camera feed
+- OpenCV DNN can run a live YOLO ONNX detector on the Jetson camera feed
+- detections are emitted with normalized positional encodings
+- a separate YOLO pose ONNX demo can draw body landmarks, arm lines, chest center, and a spine proxy
 - annotated output can be saved to video for review
+- the default Jetson deployment path currently uses `yolov4-tiny` weights + cfg
+  because it is easier to fetch on-device than exporting ONNX there
 
 Important note:
 - `jetson-inference` native binaries can be rebuilt on this JetPack 6 machine,
   but its stock Caffe sample models are not a reliable default path with
   TensorRT 10
-- the working demo here uses a more modern ONNX path instead
+- the working demo here uses OpenCV DNN with YOLO-family models rather than the
+  stock `jetson-inference` sample-model path
+
+Legacy note:
+- `jetson/inference/mobilenetv2_camera_demo.py` is still useful as a quick
+  whole-frame classification sanity check, but YOLO is now the primary path
+  for person-localized work
