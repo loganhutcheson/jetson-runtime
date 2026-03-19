@@ -4,6 +4,7 @@ carry forward on the Jetson Orin Nano after the CAM1 IMX219 bring-up.
 
 Date updated:
 - 2026-03-16
+- 2026-03-17
 
 Hardware / software context:
 - Jetson Orin Nano dev kit
@@ -24,9 +25,24 @@ Primary output paths:
 - `/home/logan/yolo-positional-demo.avi`
 - `/home/logan/yolo-positional-detections.jsonl`
 
+Validated again on 2026-03-17:
+- the positional demo ran successfully over SSH on the Jetson with:
+  - `python3 ~/jetson-runtime/jetson/inference/yolo_positional_camera_demo.py --frames 60 --print-every 10 --output ~/yolo-positional-demo.avi --positions-out ~/yolo-positional-detections.jsonl`
+- Argus opened the active camera on `sensor-id=0`
+- the run completed and wrote both output files
+- detections were empty during that validation run because the camera was not pointed at a person at the time
+
 Working repo script:
 - `jetson/inference/yolo_positional_camera_demo.py`
 - `jetson/inference/pose_camera_demo.py`
+
+Pose runtime status on 2026-03-18:
+- the Jetson now has a working JP6-compatible Torch stack in user site
+- `python3 -c 'import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)'`
+  returned:
+  - `2.10.0 True 12.6`
+- OpenCV DNN still failed on both exported pose ONNX graphs on this Jetson's `cv2 4.5.4`
+- the working live pose path is now the same `pose_camera_demo.py` script using its Ultralytics backend with a `.pt` model
 
 Default model path:
 - `yolov4-tiny` via Darknet weights + cfg because it is easy to fetch on this Jetson
@@ -36,6 +52,7 @@ Optional model path:
 
 Pose overlay path:
 - a separate YOLO pose ONNX demo is available for real-time landmarks and spine proxy visualization
+- the same script now also supports a Jetson-tested Ultralytics `.pt` backend for live inference when OpenCV DNN is not compatible with the exported ONNX
 
 What this proves:
 - camera capture is healthy
@@ -156,14 +173,46 @@ Model export path:
 - `yolo export model=yolo11n-pose.pt format=onnx opset=12 imgsz=640`
 - `mv yolo11n-pose.onnx ~/models/yolo11n-pose.onnx`
 
+Current Jetson blocker for this export path:
+- the installed Torch on the Jetson is currently mismatched to the JetPack 6 runtime stack
+- after installing `libnvtoolsext1`, `import torch` still fails with:
+  - `ImportError: libcudnn.so.8: cannot open shared object file`
+- the machine currently exposes cuDNN 9:
+  - `/usr/lib/aarch64-linux-gnu/libcudnn.so.9`
+- practical implication:
+  - `ultralytics`-based ONNX export is still blocked on-device until Torch is replaced with a JetPack-compatible build
+  - the fastest workaround is to export `yolo11n-pose.onnx` off-device and copy it into `~/models`
+
+Update on 2026-03-18:
+- this blocker is now resolved for Torch itself on the Jetson
+- installed pieces:
+  - `torch 2.10.0`
+  - `torchvision 0.25.0`
+  - `nvidia-cudss-cu12 0.7.1.6`
+  - `cuda-cupti-12-6`
+  - `sympy 1.14.0`
+- a linker config was added on the Jetson so `libcudss.so.0` resolves without a manual shell export:
+  - `/etc/ld.so.conf.d/jetson-logan-nvidia-cu12.conf`
+- ONNX export now succeeds on-device for:
+  - `/home/logan/models/yolo11n-pose.onnx`
+- however, OpenCV DNN on this Jetson still crashes at `net.forward()` for the exported pose models, so the runtime recommendation changed:
+  - use the Ultralytics `.pt` backend for live pose
+  - treat the ONNX export as useful for later experimentation, not the primary working path on this Jetson today
+
 Run:
 - `python3 ~/jetson-runtime/jetson/inference/pose_camera_demo.py --frames 300 --output ~/pose-demo.avi`
+
+Jetson-tested live pose command:
+- `python3 ~/jetson-runtime/jetson/inference/pose_camera_demo.py --backend ultralytics --model ~/models/yolov8n-pose.pt --frames 300 --output ~/pose-demo-ultra.avi --pose-out ~/pose-detections-ultra.jsonl`
 
 Useful options:
 - `--pose-out ~/pose-detections.jsonl`
 - `--imgsz 640`
 - `--kpt-thres 0.35`
 - `--calibration-frames 45`
+- `--backend ultralytics`
+- `--model ~/models/yolov8n-pose.pt`
+- `--device 0`
 
 Important interpretation note:
 - this does not directly observe the spine

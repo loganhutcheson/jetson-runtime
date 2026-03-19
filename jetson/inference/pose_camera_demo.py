@@ -4,7 +4,7 @@ import json
 import math
 import os
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -45,12 +45,19 @@ SKELETON = [
 ]
 
 
-def ensure_model(path: str) -> None:
+def ensure_model(path: str, backend: str) -> None:
     model_dir = os.path.dirname(path)
     if model_dir:
         os.makedirs(model_dir, exist_ok=True)
     if os.path.isfile(path):
         return
+
+    if backend == "ultralytics":
+        raise SystemExit(
+            f"missing {path}.\n"
+            "Download or copy a YOLO pose .pt checkpoint there first. One working path is:\n"
+            "  yolo export model=yolo11n-pose.pt format=onnx opset=12 imgsz=640"
+        )
 
     raise SystemExit(
         f"missing {path}.\n"
@@ -59,6 +66,14 @@ def ensure_model(path: str) -> None:
         "  yolo export model=yolo11n-pose.pt format=onnx opset=12 imgsz=640\n"
         f"  mv yolo11n-pose.onnx {path}"
     )
+
+
+def infer_backend(model_path: str, backend: str) -> str:
+    if backend != "auto":
+        return backend
+    if model_path.endswith(".pt"):
+        return "ultralytics"
+    return "opencv"
 
 
 def ensure_parent_dir(path: str) -> None:
@@ -222,6 +237,49 @@ def decode_pose_output(output: np.ndarray, frame_shape: Tuple[int, int], scale: 
     return [candidates[idx] for idx in keep]
 
 
+def decode_ultralytics_result(result: Any, frame_shape: Tuple[int, int], keypoint_thres: float) -> List[Dict[str, object]]:
+    boxes = getattr(result, "boxes", None)
+    keypoints = getattr(result, "keypoints", None)
+    if boxes is None or keypoints is None or boxes.xyxy is None or keypoints.data is None:
+        return []
+
+    frame_h, frame_w = frame_shape[:2]
+    xyxy = boxes.xyxy.detach().cpu().numpy()
+    confs = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else np.ones((len(xyxy),), dtype=np.float32)
+    kpts = keypoints.data.detach().cpu().numpy()
+    detections: List[Dict[str, object]] = []
+
+    for idx, box in enumerate(xyxy):
+        x1 = clamp(float(box[0]), 0.0, frame_w - 1.0)
+        y1 = clamp(float(box[1]), 0.0, frame_h - 1.0)
+        x2 = clamp(float(box[2]), 0.0, frame_w - 1.0)
+        y2 = clamp(float(box[3]), 0.0, frame_h - 1.0)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        det_keypoints = {}
+        for kpt_idx, name in enumerate(KEYPOINT_NAMES):
+            conf = float(kpts[idx][kpt_idx][2])
+            if conf < keypoint_thres:
+                continue
+            det_keypoints[name] = {
+                "x": round(clamp(float(kpts[idx][kpt_idx][0]), 0.0, frame_w - 1.0), 2),
+                "y": round(clamp(float(kpts[idx][kpt_idx][1]), 0.0, frame_h - 1.0), 2),
+                "conf": round(conf, 6),
+            }
+
+        detections.append(
+            {
+                "score": round(float(confs[idx]), 6),
+                "bbox_xyxy": [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
+                "keypoints": det_keypoints,
+            }
+        )
+
+    detections.sort(key=lambda det: det["score"], reverse=True)
+    return detections
+
+
 def draw_point(frame: np.ndarray, point: Dict[str, float], color: Tuple[int, int, int], radius: int) -> None:
     cv2.circle(frame, (int(round(point["x"])), int(round(point["y"]))), radius, color, -1, cv2.LINE_AA)
 
@@ -312,6 +370,8 @@ def annotate_pose(frame: np.ndarray, detection: Dict[str, object], baseline_deg:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=MODEL_PATH)
+    parser.add_argument("--backend", choices=["auto", "opencv", "ultralytics"], default="auto")
+    parser.add_argument("--device", default="0")
     parser.add_argument("--frames", type=int, default=180)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
@@ -327,7 +387,8 @@ def main() -> None:
     parser.add_argument("--pose-out", default="/home/logan/pose-detections.jsonl")
     args = parser.parse_args()
 
-    ensure_model(args.model)
+    backend = infer_backend(args.model, args.backend)
+    ensure_model(args.model, backend)
 
     cap = cv2.VideoCapture(
         csi_pipeline(args.width, args.height, args.fps, args.sensor_id),
@@ -336,7 +397,19 @@ def main() -> None:
     if not cap.isOpened():
         raise SystemExit("failed to open CSI camera through GStreamer")
 
-    net = cv2.dnn.readNetFromONNX(args.model)
+    if backend == "opencv":
+        net = cv2.dnn.readNetFromONNX(args.model)
+        yolo_model = None
+    else:
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise SystemExit(
+                "ultralytics backend requested but package import failed.\n"
+                "Install it with: python3 -m pip install --user ultralytics"
+            ) from exc
+        yolo_model = YOLO(args.model)
+        net = None
     ensure_parent_dir(args.output)
     ensure_parent_dir(args.pose_out)
     writer = cv2.VideoWriter(
@@ -358,26 +431,38 @@ def main() -> None:
                 print("frame read failed")
                 break
 
-            model_input, scale, pad_x, pad_y = letterbox(frame, args.imgsz)
-            blob = cv2.dnn.blobFromImage(
-                model_input,
-                scalefactor=1.0 / 255.0,
-                size=(args.imgsz, args.imgsz),
-                mean=(0, 0, 0),
-                swapRB=True,
-                crop=False,
-            )
-            net.setInput(blob)
-            detections = decode_pose_output(
-                net.forward(),
-                frame.shape,
-                scale,
-                pad_x,
-                pad_y,
-                args.conf_thres,
-                args.nms_thres,
-                args.kpt_thres,
-            )
+            if backend == "opencv":
+                model_input, scale, pad_x, pad_y = letterbox(frame, args.imgsz)
+                blob = cv2.dnn.blobFromImage(
+                    model_input,
+                    scalefactor=1.0 / 255.0,
+                    size=(args.imgsz, args.imgsz),
+                    mean=(0, 0, 0),
+                    swapRB=True,
+                    crop=False,
+                )
+                net.setInput(blob)
+                detections = decode_pose_output(
+                    net.forward(),
+                    frame.shape,
+                    scale,
+                    pad_x,
+                    pad_y,
+                    args.conf_thres,
+                    args.nms_thres,
+                    args.kpt_thres,
+                )
+            else:
+                results = yolo_model.predict(
+                    source=frame,
+                    imgsz=args.imgsz,
+                    conf=args.conf_thres,
+                    iou=args.nms_thres,
+                    device=args.device,
+                    verbose=False,
+                    max_det=1,
+                )
+                detections = decode_ultralytics_result(results[0], frame.shape, args.kpt_thres) if results else []
 
             primary_detection = detections[0] if detections else None
             if primary_detection:
