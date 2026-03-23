@@ -44,6 +44,115 @@ Pose runtime status on 2026-03-18:
 - OpenCV DNN still failed on both exported pose ONNX graphs on this Jetson's `cv2 4.5.4`
 - the working live pose path is now the same `pose_camera_demo.py` script using its Ultralytics backend with a `.pt` model
 
+----- 30-Minute Recording Plan -----
+If your goal is to train `bad / okay / good` posture from this exact camera angle,
+collect one clean 30-minute pose dataset before worrying about model training.
+
+What to record:
+- 10 minutes of `good`
+- 10 minutes of `okay`
+- 10 minutes of `bad`
+
+Why this split:
+- it gives balanced class time
+- it keeps labeling simple
+- it matches the current camera angle and desk setup instead of mixing viewpoints
+
+Before you start:
+1. Keep the camera physically fixed.
+2. Keep the chair, desk, and monitor in their normal positions.
+3. Turn the lights on and leave them stable.
+4. Sit where you normally work.
+5. Avoid changing the zoom, crop, or camera mount between class recordings.
+
+Recommended directory layout on the Jetson:
+- `mkdir -p ~/posture-data/good ~/posture-data/okay ~/posture-data/bad`
+
+Recommended live pose command template:
+- `python3 ~/jetson-runtime/jetson/inference/pose_camera_demo.py --backend ultralytics --model ~/models/yolov8n-pose.pt --frames 54000 --output ~/posture-data/<label>/<label>.avi --pose-out ~/posture-data/<label>/<label>.jsonl`
+
+Why `54000` frames:
+- `30 minutes * 60 seconds * 30 fps = 54000`
+
+Practical recommendation:
+- do not actually record all 30 minutes in one file
+- record three separate 10-minute sessions instead
+- that makes labels unambiguous and makes failed runs cheaper to redo
+
+10-minute per-class commands:
+- `python3 ~/jetson-runtime/jetson/inference/pose_camera_demo.py --backend ultralytics --model ~/models/yolov8n-pose.pt --frames 18000 --output ~/posture-data/good/good_001.avi --pose-out ~/posture-data/good/good_001.jsonl`
+- `python3 ~/jetson-runtime/jetson/inference/pose_camera_demo.py --backend ultralytics --model ~/models/yolov8n-pose.pt --frames 18000 --output ~/posture-data/okay/okay_001.avi --pose-out ~/posture-data/okay/okay_001.jsonl`
+- `python3 ~/jetson-runtime/jetson/inference/pose_camera_demo.py --backend ultralytics --model ~/models/yolov8n-pose.pt --frames 18000 --output ~/posture-data/bad/bad_001.avi --pose-out ~/posture-data/bad/bad_001.jsonl`
+
+How to perform each class:
+- `good`:
+  - sit tall in the position you actually want to maintain
+  - shoulders level
+  - chest open
+  - head roughly centered above torso
+- `okay`:
+  - your normal, acceptable working posture
+  - not ideal, but not strongly slouched
+  - slight lean or asymmetry is fine
+- `bad`:
+  - the posture you want the system to catch
+  - for example forward head, rounded shoulders, or chest collapse
+  - use realistic bad posture, not a cartoon exaggeration
+
+What to do during recording:
+- type, read, look at the screen, and make small natural movements
+- include slight shifts and fidgets
+- do not freeze in one pose for the full recording
+- stay inside the camera view
+
+What not to do:
+- do not mix multiple labels in one recording
+- do not move the camera between recordings
+- do not change lighting halfway through
+- do not let another person enter frame if you can avoid it
+
+Quick validation after each recording:
+1. Confirm the `.avi` file exists.
+2. Confirm the `.jsonl` file exists.
+3. Check the first few lines:
+   - `sed -n '1,3p' ~/posture-data/good/good_001.jsonl`
+4. Check the last line:
+   - `tail -n 1 ~/posture-data/good/good_001.jsonl`
+5. Make sure `primary_detection` is usually not `null`.
+
+Minimum acceptable dataset for the next step:
+- at least one 10-minute file for each of:
+  - `good`
+  - `okay`
+  - `bad`
+
+Better dataset:
+- 2 to 3 recordings per class on different days
+- same camera angle
+- same person
+- slightly different shirts / lighting / time of day
+
+What we will train from later:
+- primarily the pose JSONL, not raw pixels first
+- features like:
+  - chest center
+  - hip center
+  - torso angle
+  - shoulder tilt
+  - nose-to-chest relation
+  - short time-window motion and stability
+
+What to read tomorrow before prompting again:
+1. This `30-Minute Recording Plan` section.
+2. `----- Pose Estimation Demo -----` below.
+3. `jetson/inference/pose_camera_demo.py`
+
+When you come back next, the useful handoff is:
+- which recordings you captured
+- where they are stored
+- whether any recordings had `primary_detection: null` too often
+- whether your `good / okay / bad` definitions need to be tightened
+
 Default model path:
 - `yolov4-tiny` via Darknet weights + cfg because it is easy to fetch on this Jetson
 
