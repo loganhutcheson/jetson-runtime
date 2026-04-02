@@ -9,6 +9,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from oled_status_display import OledStatusDisplay
+from posture_classifier import (
+    PostureSmoother,
+    PostureWindowBuffer,
+    extract_posture_features,
+    load_posture_model,
+    predict_posture,
+)
+
 # Default pose model path for the OpenCV DNN backend. Passing a `.pt` model
 # switches the script to the Ultralytics runtime instead.
 MODEL_PATH = "/home/logan/models/yolo11n-pose.onnx"
@@ -323,7 +332,8 @@ def draw_line(frame: np.ndarray, a: Dict[str, float], b: Dict[str, float],
     )
 
 
-def annotate_pose(frame: np.ndarray, detection: Dict[str, object], baseline_deg: Optional[float]) -> None:
+def annotate_pose(frame: np.ndarray, detection: Dict[str, object], baseline_deg: Optional[float],
+                  posture_result: Optional[Dict[str, object]]) -> None:
     # Visualization layer for debugging and dataset review. It does not change
     # the metrics that are written to JSONL.
     x1, y1, x2, y2 = [int(round(v)) for v in detection["bbox_xyxy"]]
@@ -395,6 +405,42 @@ def annotate_pose(frame: np.ndarray, detection: Dict[str, object], baseline_deg:
             cv2.LINE_AA,
         )
 
+    if posture_result:
+        posture_lines = [
+            f"posture={posture_result['label']} {posture_result['confidence']:.2f}",
+            " ".join(
+                f"{label}:{posture_result['probabilities'][label]:.2f}"
+                for label in posture_result["probabilities"]
+            ),
+        ]
+        for idx, text in enumerate(posture_lines):
+            cv2.putText(
+                frame,
+                text,
+                (x1, max(24, y1 - 34 - idx * 24)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (50, 240, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+
+def posture_display_text(primary_detection: Optional[Dict[str, object]],
+                         posture_result: Optional[Dict[str, object]]) -> str:
+    if not primary_detection:
+        return "not found"
+    if not posture_result:
+        return "not found"
+    label = posture_result.get("label")
+    if label == "good":
+        return "good"
+    if label == "okay":
+        return "okay"
+    if label == "bad":
+        return "bad"
+    return "not found"
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -414,6 +460,15 @@ def main() -> None:
     parser.add_argument("--print-every", type=int, default=15)
     parser.add_argument("--output", default="/home/logan/pose-demo.avi")
     parser.add_argument("--pose-out", default="/home/logan/pose-detections.jsonl")
+    parser.add_argument("--posture-model", default="")
+    parser.add_argument("--posture-window", type=int, default=20)
+    parser.add_argument("--posture-min-frames", type=int, default=12)
+    parser.add_argument("--posture-smoothing", type=float, default=0.25)
+    parser.add_argument("--oled-status", action="store_true")
+    parser.add_argument("--oled-i2c-dev", default=os.environ.get("JETSON_OLED_I2C_DEV", "/dev/i2c-7"))
+    parser.add_argument("--oled-i2c-addr", type=lambda value: int(value, 0),
+                        default=int(os.environ.get("JETSON_OLED_I2C_ADDR", "0x3c"), 0))
+    parser.add_argument("--show", action="store_true")
     args = parser.parse_args()
 
     backend = infer_backend(args.model, args.backend)
@@ -455,112 +510,186 @@ def main() -> None:
     last_report: Dict[str, object] = {}
     baseline_samples: List[float] = []
     baseline_deg: Optional[float] = None
-
-    with open(args.pose_out, "w", encoding="utf-8") as pose_file:
-        for frame_idx in range(args.frames):
-            ok, frame = cap.read()
-            if not ok:
-                print("frame read failed")
-                break
-
-            if backend == "opencv":
-                # Match the exported YOLO pose graph's expected square input,
-                # then translate outputs back to original frame coordinates.
-                model_input, scale, pad_x, pad_y = letterbox(frame, args.imgsz)
-                blob = cv2.dnn.blobFromImage(
-                    model_input,
-                    scalefactor=1.0 / 255.0,
-                    size=(args.imgsz, args.imgsz),
-                    mean=(0, 0, 0),
-                    swapRB=True,
-                    crop=False,
-                )
-                net.setInput(blob)
-                detections = decode_pose_output(
-                    net.forward(),
-                    frame.shape,
-                    scale,
-                    pad_x,
-                    pad_y,
-                    args.conf_thres,
-                    args.nms_thres,
-                    args.kpt_thres,
-                )
-            else:
-                # Limit live inference to the top detection because this script
-                # is currently centered on single-subject posture capture.
-                results = yolo_model.predict(
-                    source=frame,
-                    imgsz=args.imgsz,
-                    conf=args.conf_thres,
-                    iou=args.nms_thres,
-                    device=args.device,
-                    verbose=False,
-                    max_det=1,
-                )
-                detections = decode_ultralytics_result(results[0], frame.shape, args.kpt_thres) if results else []
-
-            primary_detection = detections[0] if detections else None
-            if primary_detection:
-                # Build derived posture metrics on top of raw landmarks.
-                primary_detection["metrics"] = build_pose_metrics(
-                    primary_detection["keypoints"],
-                    primary_detection["bbox_xyxy"],
-                    baseline_deg,
-                )
-                torso_angle = primary_detection["metrics"].get("torso_angle_deg")
-                if torso_angle is not None and baseline_deg is None and len(baseline_samples) < args.calibration_frames:
-                    # Use the first calibration window to establish the user's
-                    # neutral torso angle for the current camera placement.
-                    baseline_samples.append(float(torso_angle))
-                    if len(baseline_samples) == args.calibration_frames:
-                        baseline_deg = float(sum(baseline_samples) / len(baseline_samples))
-                        primary_detection["metrics"]["lean_delta_deg"] = round(
-                            primary_detection["metrics"]["torso_angle_deg"] - baseline_deg,
-                            3,
-                        )
-                elif torso_angle is not None and baseline_deg is not None:
-                    primary_detection["metrics"]["lean_delta_deg"] = round(float(torso_angle) - baseline_deg, 3)
-
-                annotate_pose(frame, primary_detection, baseline_deg)
-
-            # The on-frame status text makes calibration progress visible in the
-            # saved review video even without opening the JSONL output.
-            status = f"calib={len(baseline_samples)}/{args.calibration_frames}" if baseline_deg is None else f"baseline={baseline_deg:.1f}deg"
-            cv2.putText(
-                frame,
-                status,
-                (20, 34),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 220, 255),
-                2,
-                cv2.LINE_AA,
+    posture_model = load_posture_model(args.posture_model) if args.posture_model else None
+    posture_buffer = PostureWindowBuffer(args.posture_window) if posture_model else None
+    posture_smoother = (
+        PostureSmoother(posture_model["labels"], args.posture_smoothing)
+        if posture_model else None
+    )
+    posture_result: Optional[Dict[str, object]] = None
+    oled_display: Optional[OledStatusDisplay] = None
+    if args.oled_status:
+        try:
+            oled_display = OledStatusDisplay(
+                enabled=True,
+                i2c_device=args.oled_i2c_dev,
+                i2c_address=args.oled_i2c_addr,
             )
-            writer.write(frame)
+            oled_display.write_text("not found")
+            print(f"[OLED] enabled dev={args.oled_i2c_dev} addr=0x{args.oled_i2c_addr:02x}")
+        except Exception as exc:
+            oled_display = None
+            print(f"[OLED] init failed: {exc}")
 
-            report = {
-                "frame": frame_idx,
-                "t_wall_s": round(time.time() - start, 6),
-                "baseline_deg": round(baseline_deg, 6) if baseline_deg is not None else None,
-                "primary_detection": primary_detection,
-            }
-            # Write one JSON object per frame so later analysis can stream or
-            # grep the capture without loading the whole run into memory.
-            pose_file.write(json.dumps(report) + "\n")
-            last_report = report
+    try:
+        with open(args.pose_out, "w", encoding="utf-8") as pose_file:
+            for frame_idx in range(args.frames):
+                ok, frame = cap.read()
+                if not ok:
+                    print("frame read failed")
+                    break
 
-            if frame_idx % args.print_every == 0:
-                print(
-                    f"frame={frame_idx} "
-                    f"have_pose={1 if primary_detection else 0} "
-                    f"baseline={report['baseline_deg']} "
-                    f"primary={primary_detection}"
+                if backend == "opencv":
+                    # Match the exported YOLO pose graph's expected square input,
+                    # then translate outputs back to original frame coordinates.
+                    model_input, scale, pad_x, pad_y = letterbox(frame, args.imgsz)
+                    blob = cv2.dnn.blobFromImage(
+                        model_input,
+                        scalefactor=1.0 / 255.0,
+                        size=(args.imgsz, args.imgsz),
+                        mean=(0, 0, 0),
+                        swapRB=True,
+                        crop=False,
+                    )
+                    net.setInput(blob)
+                    detections = decode_pose_output(
+                        net.forward(),
+                        frame.shape,
+                        scale,
+                        pad_x,
+                        pad_y,
+                        args.conf_thres,
+                        args.nms_thres,
+                        args.kpt_thres,
+                    )
+                else:
+                    # Limit live inference to the top detection because this script
+                    # is currently centered on single-subject posture capture.
+                    results = yolo_model.predict(
+                        source=frame,
+                        imgsz=args.imgsz,
+                        conf=args.conf_thres,
+                        iou=args.nms_thres,
+                        device=args.device,
+                        verbose=False,
+                        max_det=1,
+                    )
+                    detections = decode_ultralytics_result(results[0], frame.shape, args.kpt_thres) if results else []
+
+                primary_detection = detections[0] if detections else None
+                if primary_detection:
+                    # Build derived posture metrics on top of raw landmarks.
+                    primary_detection["metrics"] = build_pose_metrics(
+                        primary_detection["keypoints"],
+                        primary_detection["bbox_xyxy"],
+                        baseline_deg,
+                    )
+                    torso_angle = primary_detection["metrics"].get("torso_angle_deg")
+                    if torso_angle is not None and baseline_deg is None and len(baseline_samples) < args.calibration_frames:
+                        # Use the first calibration window to establish the user's
+                        # neutral torso angle for the current camera placement.
+                        baseline_samples.append(float(torso_angle))
+                        if len(baseline_samples) == args.calibration_frames:
+                            baseline_deg = float(sum(baseline_samples) / len(baseline_samples))
+                            primary_detection["metrics"]["lean_delta_deg"] = round(
+                                primary_detection["metrics"]["torso_angle_deg"] - baseline_deg,
+                                3,
+                            )
+                    elif torso_angle is not None and baseline_deg is not None:
+                        primary_detection["metrics"]["lean_delta_deg"] = round(float(torso_angle) - baseline_deg, 3)
+
+                    if posture_model and posture_buffer and posture_smoother:
+                        posture_buffer.append(extract_posture_features(primary_detection))
+                        if posture_buffer.ready(args.posture_min_frames):
+                            raw_posture = predict_posture(
+                                posture_model,
+                                posture_buffer.aggregate(posture_model["feature_names"]),
+                            )
+                            smoothed_probs = posture_smoother.update(raw_posture["probabilities"])
+                            smoothed_label = max(smoothed_probs, key=smoothed_probs.get)
+                            posture_result = {
+                                "label": smoothed_label,
+                                "confidence": smoothed_probs[smoothed_label],
+                                "probabilities": smoothed_probs,
+                                "raw_label": raw_posture["label"],
+                                "raw_confidence": raw_posture["confidence"],
+                                "raw_probabilities": raw_posture["probabilities"],
+                            }
+
+                    annotate_pose(frame, primary_detection, baseline_deg, posture_result)
+                else:
+                    posture_result = None
+
+                if oled_display:
+                    try:
+                        oled_display.write_text(posture_display_text(primary_detection, posture_result))
+                    except Exception as exc:
+                        print(f"[OLED] write failed: {exc}")
+                        oled_display.close()
+                        oled_display = None
+
+                # The on-frame status text makes calibration progress visible in the
+                # saved review video even without opening the JSONL output.
+                status = f"calib={len(baseline_samples)}/{args.calibration_frames}" if baseline_deg is None else f"baseline={baseline_deg:.1f}deg"
+                cv2.putText(
+                    frame,
+                    status,
+                    (20, 34),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 220, 255),
+                    2,
+                    cv2.LINE_AA,
                 )
+                if posture_result:
+                    cv2.putText(
+                        frame,
+                        f"live posture: {posture_result['label']} ({posture_result['confidence']:.2f})",
+                        (20, 68),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (50, 240, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                writer.write(frame)
+                if args.show:
+                    cv2.imshow("pose_camera_demo", frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (27, ord("q")):
+                        break
+
+                report = {
+                    "frame": frame_idx,
+                    "t_wall_s": round(time.time() - start, 6),
+                    "baseline_deg": round(baseline_deg, 6) if baseline_deg is not None else None,
+                    "primary_detection": primary_detection,
+                    "posture_prediction": posture_result,
+                    "oled_status_text": posture_display_text(primary_detection, posture_result),
+                }
+                # Write one JSON object per frame so later analysis can stream or
+                # grep the capture without loading the whole run into memory.
+                pose_file.write(json.dumps(report) + "\n")
+                last_report = report
+
+                if frame_idx % args.print_every == 0:
+                    print(
+                        f"frame={frame_idx} "
+                        f"have_pose={1 if primary_detection else 0} "
+                        f"baseline={report['baseline_deg']} "
+                        f"posture={posture_result['label'] if posture_result else None} "
+                        f"oled='{report['oled_status_text']}' "
+                        f"primary={primary_detection}"
+                    )
+    finally:
+        if oled_display:
+            oled_display.close()
 
     elapsed = time.time() - start
     cap.release()
     writer.release()
+    if args.show:
+        cv2.destroyAllWindows()
     print(
         f"done frames={last_report.get('frame', -1) + 1} elapsed={elapsed:.2f}s "
         f"fps={max(last_report.get('frame', -1) + 1, 0) / max(elapsed, 1e-6):.2f} "
