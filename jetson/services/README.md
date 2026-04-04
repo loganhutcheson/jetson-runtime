@@ -36,3 +36,25 @@ Return to service mode:
 sudo systemctl start posture-runtime.service
 sudo systemctl status posture-runtime.service
 ```
+
+## Dashboard Service
+
+Install the dashboard service on the Jetson:
+
+```bash
+cd /home/logan/jetson-runtime
+./jetson/services/install_posture_dashboard_service.sh
+sudo systemctl enable --now posture-dashboard.service
+```
+
+Edit the dashboard configuration in:
+
+```bash
+/etc/default/posture-dashboard
+```
+
+By default it serves the SQLite history on:
+
+```bash
+http://<jetson-host>:8787/
+```

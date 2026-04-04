@@ -1,0 +1,18 @@
+[Unit]
+Description=Posture history dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=logan
+WorkingDirectory=/home/logan/jetson-runtime
+EnvironmentFile=-/etc/default/posture-dashboard
+ExecStart=/home/logan/jetson-runtime/jetson/services/run_posture_dashboard.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
