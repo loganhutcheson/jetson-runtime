@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 import os
+import signal
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -94,6 +95,8 @@ def infer_backend(model_path: str, backend: str) -> str:
 
 
 def ensure_parent_dir(path: str) -> None:
+    if not path:
+        return
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -442,6 +445,16 @@ def posture_display_text(primary_detection: Optional[Dict[str, object]],
     return "not found"
 
 
+class ShutdownSignal:
+    def __init__(self) -> None:
+        self.stop_requested = False
+        self.reason = ""
+
+    def handler(self, signum: int, _frame: object) -> None:
+        self.stop_requested = True
+        self.reason = signal.Signals(signum).name
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=MODEL_PATH)
@@ -473,6 +486,9 @@ def main() -> None:
 
     backend = infer_backend(args.model, args.backend)
     ensure_model(args.model, backend)
+    shutdown = ShutdownSignal()
+    signal.signal(signal.SIGTERM, shutdown.handler)
+    signal.signal(signal.SIGINT, shutdown.handler)
 
     # Open the Jetson CSI camera through the Argus-backed GStreamer pipeline.
     cap = cv2.VideoCapture(
@@ -499,12 +515,16 @@ def main() -> None:
         net = None
     ensure_parent_dir(args.output)
     ensure_parent_dir(args.pose_out)
-    writer = cv2.VideoWriter(
-        args.output,
-        cv2.VideoWriter_fourcc(*"MJPG"),
-        min(args.fps, 10),
-        (args.width, args.height),
-    )
+    writer: Optional[cv2.VideoWriter]
+    if args.output:
+        writer = cv2.VideoWriter(
+            args.output,
+            cv2.VideoWriter_fourcc(*"MJPG"),
+            min(args.fps, 10),
+            (args.width, args.height),
+        )
+    else:
+        writer = None
 
     start = time.time()
     last_report: Dict[str, object] = {}
@@ -532,8 +552,13 @@ def main() -> None:
             print(f"[OLED] init failed: {exc}")
 
     try:
-        with open(args.pose_out, "w", encoding="utf-8") as pose_file:
-            for frame_idx in range(args.frames):
+        pose_file = open(args.pose_out, "w", encoding="utf-8") if args.pose_out else None
+        with pose_file if pose_file is not None else open(os.devnull, "w", encoding="utf-8") as active_pose_file:
+            frame_idx = 0
+            while args.frames <= 0 or frame_idx < args.frames:
+                if shutdown.stop_requested:
+                    print(f"shutdown requested via {shutdown.reason}")
+                    break
                 ok, frame = cap.read()
                 if not ok:
                     print("frame read failed")
@@ -652,7 +677,8 @@ def main() -> None:
                         2,
                         cv2.LINE_AA,
                     )
-                writer.write(frame)
+                if writer is not None:
+                    writer.write(frame)
                 if args.show:
                     cv2.imshow("pose_camera_demo", frame)
                     key = cv2.waitKey(1) & 0xFF
@@ -669,7 +695,8 @@ def main() -> None:
                 }
                 # Write one JSON object per frame so later analysis can stream or
                 # grep the capture without loading the whole run into memory.
-                pose_file.write(json.dumps(report) + "\n")
+                if args.pose_out:
+                    active_pose_file.write(json.dumps(report) + "\n")
                 last_report = report
 
                 if frame_idx % args.print_every == 0:
@@ -681,13 +708,15 @@ def main() -> None:
                         f"oled='{report['oled_status_text']}' "
                         f"primary={primary_detection}"
                     )
+                frame_idx += 1
     finally:
         if oled_display:
             oled_display.close()
 
     elapsed = time.time() - start
     cap.release()
-    writer.release()
+    if writer is not None:
+        writer.release()
     if args.show:
         cv2.destroyAllWindows()
     print(

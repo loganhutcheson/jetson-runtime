@@ -1,0 +1,20 @@
+[Unit]
+Description=Always-on posture runtime
+After=network-online.target nvargus-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=logan
+WorkingDirectory=/home/logan/jetson-runtime
+EnvironmentFile=-/etc/default/posture-runtime
+ExecStart=/home/logan/jetson-runtime/jetson/services/run_posture_runtime.sh
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
